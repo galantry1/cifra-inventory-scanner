@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import Scanner from './components/Scanner';
 import XlsImport from './components/XlsImport';
 import { Asset } from './types/asset';
@@ -105,7 +106,6 @@ export default function InventoryScannerApp() {
     const newCab = fmtCab(val);
     if (!newCab) return;
 
-    // локально
     setAllItems(prev => {
       const m = new Map(prev.map(x => [x.inv, x]));
       const it = m.get(inv);
@@ -115,8 +115,26 @@ export default function InventoryScannerApp() {
       return [...m.values()];
     });
 
-    // всем в сессии
     socketRef.current?.emit('relocate', { sid, inv, actualLocation: newCab });
+  }
+
+  // === ЭКСПОРТ XLS (только отсканированное) ===
+  function exportXls() {
+    const header = ['Наименование', 'ШК', 'Расположение'];
+    const rows = scannedItems.map(it => [
+      it.name,
+      it.inv,
+      it.actualLocation || it.location || ''
+    ]);
+    const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Результат');
+
+    const now = new Date();
+    const pad = (n:number)=>String(n).padStart(2,'0');
+    const fname = `inventory_${sid}_${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}.xlsx`;
+
+    XLSX.writeFile(wb, fname);
   }
 
   return (
@@ -124,7 +142,10 @@ export default function InventoryScannerApp() {
       <div className="sticky top-0 z-10 bg-white/90 backdrop-blur border-b border-green-100 px-3 pt-[env(safe-area-inset-top)]">
         <div className="py-2 flex items-center gap-2">
           <div className="text-base font-semibold">Инвентаризация</div>
-          <div className="ml-auto text-xs text-gray-500">Сессия: <b>{sid}</b></div>
+          <div className="ml-auto flex items-center gap-2">
+            <button className="btnSecondary" onClick={exportXls}>Экспорт XLS</button>
+            <div className="text-xs text-gray-500">Сессия: <b>{sid}</b></div>
+          </div>
         </div>
       </div>
 
@@ -154,7 +175,6 @@ export default function InventoryScannerApp() {
         {camOn && <Scanner onResult={onScan} />}
       </div>
 
-      {/* Список: только отсканированные */}
       <div className="card m-3">
         <div className="font-medium mb-2">Найденные ({scannedItems.length})</div>
         <div className="max-h-[55vh] overflow-auto border rounded-xl">
@@ -191,17 +211,11 @@ export default function InventoryScannerApp() {
                     </td>
                     <td className="px-2 py-1 text-right">
                       {!actual ? (
-                        <button
-                          className="rounded-xl px-2 py-1 border border-gray-200"
-                          onClick={()=>setActualCab(it.inv)}
-                          title="Добавить фактический кабинет"
-                        >+</button>
+                        <button className="rounded-xl px-2 py-1 border border-gray-200" onClick={()=>setActualCab(it.inv)} title="Добавить фактический кабинет">+</button>
                       ) : (
-                        <button
-                          className="rounded-xl px-2 py-1 border border-gray-200"
-                          onClick={()=>setActualCab(it.inv)}
-                          title="Изменить фактический кабинет"
-                        >{actual.replace('каб. ', '')}</button>
+                        <button className="rounded-xl px-2 py-1 border border-gray-200" onClick={()=>setActualCab(it.inv)} title="Изменить фактический кабинет">
+                          {actual.replace('каб. ', '')}
+                        </button>
                       )}
                     </td>
                   </tr>
