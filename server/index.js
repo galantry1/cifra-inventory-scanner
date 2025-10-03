@@ -8,16 +8,20 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const http = createServer(app);
-const io = new Server(http, { cors: { origin: '*' } });
+const io = new Server(http, {
+  cors: { origin: '*' },
+  pingTimeout: 25000,
+  pingInterval: 20000,
+});
 
-// Память: sessions[sessionId] = { items: Map(inv => item) }
+// sessions[sid] = { items: Map(inv -> item) }
 const sessions = Object.create(null);
 
-// REST: импорт базы на сервак
+// импорт списка
 app.post('/api/session/:sid/import', (req, res) => {
   const sid = req.params.sid;
   const { items } = req.body;
-  if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok:false });
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ ok: false });
 
   if (!sessions[sid]) sessions[sid] = { items: new Map() };
   const S = sessions[sid];
@@ -37,17 +41,26 @@ app.post('/api/session/:sid/import', (req, res) => {
     });
   }
   io.to(sid).emit('state', { items: [...S.items.values()] });
-  res.json({ ok:true, count: S.items.size });
+  res.json({ ok: true, count: S.items.size });
 });
 
-// REST: получить состояние
+// получить состояние
 app.get('/api/session/:sid/items', (req, res) => {
   const sid = req.params.sid;
   const S = sessions[sid];
-  res.json({ ok:true, items: S ? [...S.items.values()] : [] });
+  res.json({ ok: true, items: S ? [...S.items.values()] : [] });
 });
 
-// WS: join + scan
+// Полная очистка сессии
+app.delete('/api/session/:sid/clear', (req, res) => {
+  const sid = req.params.sid;
+  if (!sessions[sid]) sessions[sid] = { items: new Map() };
+  sessions[sid].items.clear();
+  io.to(sid).emit('state', { items: [] });
+  res.json({ ok: true });
+});
+
+// сокеты: join + scan
 io.on('connection', (socket) => {
   socket.on('join', ({ sid, userId }) => {
     socket.join(sid);
@@ -58,22 +71,17 @@ io.on('connection', (socket) => {
   socket.on('scan', ({ sid, userId, inv }) => {
     const S = sessions[sid];
     if (!S) return;
-    const it = S.items.get(inv) || null;
-    if (!it) {
-      // можно опционально добавить «не найдено»
-      return;
-    }
-    if (it.scannedAt) {
-      it.duplicateCount = (it.duplicateCount || 0) + 1;
-    } else {
-      it.scannedAt = new Date().toISOString();
-    }
-    it.lastUser = userId;
-    S.items.set(inv, it);
+    const it = S.items.get(inv);
+    if (!it) return; // код не найден в базе
 
+    if (it.scannedAt) it.duplicateCount = (it.duplicateCount || 0) + 1;
+    else it.scannedAt = new Date().toISOString();
+    it.lastUser = userId;
+
+    S.items.set(inv, it);
     io.to(sid).emit('itemUpdated', it);
   });
 });
 
 const PORT = process.env.PORT || 3001;
-http.listen(PORT, () => console.log('server on :'+PORT));
+http.listen(PORT, () => console.log('server on :' + PORT));
