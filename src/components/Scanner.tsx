@@ -1,102 +1,195 @@
-// src/components/Scanner.tsx
 import React from 'react';
-import { ZXWorker } from '../workers/zx-worker';
+import { BrowserMultiFormatReader, DecodeHintType, BarcodeFormat } from '@zxing/browser';
 
-const SUPPORTS_BARCODE = typeof window !== 'undefined' && 'BarcodeDetector' in window;
-const BARCODE_FORMATS = ['qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','codabar'] as const;
+const HAS_BD = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+const UA = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+const IS_IOS = /iPhone|iPad|iPod/i.test(UA);
+const HAS_CREATE_IMAGE_BITMAP = typeof window !== 'undefined' && 'createImageBitmap' in window;
 
-export default function Scanner({ onResult, singleShot=false, onError }:{
-  onResult:(text:string)=>void;
-  singleShot?: boolean;
-  onError?: (e:any)=>void;
-}){
+const BARCODE_FORMATS = [
+  'qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','codabar'
+] as const;
+
+export default function Scanner({
+  onResult, singleShot = false, onError
+}: { onResult: (text:string)=>void; singleShot?: boolean; onError?: (e:any)=>void; }) {
+
   const videoRef = React.useRef<HTMLVideoElement|null>(null);
   const canvasRef = React.useRef<HTMLCanvasElement|null>(null);
   const [stream, setStream] = React.useState<MediaStream|null>(null);
   const [torch, setTorch] = React.useState(false);
-  const [running, setRunning] = React.useState(true);
-  const lastTextRef = React.useRef<string>('');   // анти-дубли
-  const lastTsRef = React.useRef<number>(0);
-  const workerRef = React.useRef<ZXWorker|null>(null);
-  const rAFRef = React.useRef<number|undefined>(undefined);
+  const runningRef = React.useRef(true);
+  const lastTextRef = React.useRef('');   // анти-дубли
+  const lastTsRef = React.useRef(0);
+  const rAFRef = React.useRef<number>();
+  const zxingRef = React.useRef<BrowserMultiFormatReader|null>(null);
 
-  React.useEffect(()=>{ init(); return cleanup; },[]);
+  React.useEffect(() => { init(); return cleanup; }, []);
 
-  async function init(){
-    try{
+  async function init() {
+    try {
       const constraints: MediaStreamConstraints = {
-        video: { facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}, focusMode:'continuous' as any },
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
         audio: false
       };
       const st = await navigator.mediaDevices.getUserMedia(constraints);
       setStream(st);
-      if (videoRef.current){ videoRef.current.srcObject = st; await videoRef.current.play(); }
-      if (!SUPPORTS_BARCODE){ workerRef.current = new ZXWorker(); await workerRef.current.init(); }
-      setRunning(true);
-      tick();
-    }catch(e){ onError?.(e); }
+      const v = videoRef.current!;
+      v.srcObject = st;
+      await v.play();
+
+      runningRef.current = true;
+
+      // Путь 1: нативный BarcodeDetector — быстрый
+      if (HAS_BD) {
+        tickBD();
+        return;
+      }
+
+      // Путь 2: надёжный мобильный фоллбек — ZXing по <video>
+      // (для iOS/старых браузеров, где нет createImageBitmap)
+      if (IS_IOS || !HAS_CREATE_IMAGE_BITMAP) {
+        const reader = new BrowserMultiFormatReader();
+        zxingRef.current = reader;
+
+        // подсказки форматов
+        const hints = new Map();
+        hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+          BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128, BarcodeFormat.EAN_13,
+          BarcodeFormat.EAN_8, BarcodeFormat.ITF, BarcodeFormat.CODABAR,
+          BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.CODE_39
+        ]);
+        reader.setHints(hints);
+
+        await reader.decodeFromVideoElement(v, (res, err) => {
+          if (!runningRef.current) return;
+          if (res?.getText) {
+            deliver(res.getText());
+            if (singleShot) stopZX(); // инициализируем остановку
+          }
+        });
+        return;
+      }
+
+      // Путь 3: worker/канвас (для Android/десктопа)
+      tickCanvasZX();
+    } catch (e) {
+      onError?.(e);
+    }
   }
 
-  function cleanup(){
-    setRunning(false);
+  function cleanup() {
+    runningRef.current = false;
     if (rAFRef.current) cancelAnimationFrame(rAFRef.current);
-    stream?.getTracks().forEach(t=>t.stop());
-    workerRef.current?.terminate();
+    if (zxingRef.current) { try { zxingRef.current.reset(); } catch {} zxingRef.current = null; }
+    stream?.getTracks().forEach(t => t.stop());
   }
 
-  function toggleTorch(){
+  function stopZX() {
+    runningRef.current = false;
+    if (zxingRef.current) { try { zxingRef.current.reset(); } catch {} zxingRef.current = null; }
+  }
+
+  function toggleTorch() {
     const track = stream?.getVideoTracks?.()[0];
     if (!track) return;
-    const cap = (track as any).getCapabilities?.();
-    if (cap?.torch){
-      setTorch(t => { (track as any).applyConstraints?.({ advanced:[{ torch:!t }] }); return !t; });
+    const caps = (track as any).getCapabilities?.();
+    if (caps?.torch) {
+      setTorch(t => {
+        (track as any).applyConstraints?.({ advanced: [{ torch: !t }] });
+        return !t;
+      });
     }
   }
 
-  async function decodeFrame(bitmap: ImageBitmap): Promise<string|null>{
-    if (SUPPORTS_BARCODE){
-      // @ts-ignore
-      const det = new window.BarcodeDetector({ formats: BARCODE_FORMATS as any });
-      const res = await det.detect(bitmap);
-      return res?.[0]?.rawValue || null;
-    } else {
-      return await workerRef.current!.decode(bitmap);
+  function deliver(txt: string) {
+    const now = performance.now();
+    const text = String(txt || '').trim();
+    if (!text) return;
+    if (text !== lastTextRef.current || (now - lastTsRef.current) > 2000) {
+      lastTextRef.current = text;
+      lastTsRef.current = now;
+      onResult(text);
     }
   }
 
-  function tick(){
-    if (!running || !videoRef.current) return;
-    const v = videoRef.current;
-    const draw = async () => {
-      try{
+  /** ===== BarcodeDetector loop ===== */
+  async function tickBD() {
+    const v = videoRef.current!;
+    // @ts-ignore
+    const det = new window.BarcodeDetector({ formats: BARCODE_FORMATS as any });
+
+    const loop = async () => {
+      if (!runningRef.current) return;
+      try {
+        // @ts-ignore
+        if ('requestVideoFrameCallback' in v) {
+          // @ts-ignore
+          await new Promise<void>(r => v.requestVideoFrameCallback(() => r()));
+        } else {
+          await new Promise<void>(r => { rAFRef.current = requestAnimationFrame(() => r()); });
+        }
         const w = 320;
         const h = Math.round(v.videoHeight * (w / v.videoWidth || 1));
         const cnv = canvasRef.current!;
         cnv.width = w; cnv.height = h;
         const ctx = cnv.getContext('2d', { willReadFrequently:true })!;
         ctx.drawImage(v, 0, 0, w, h);
-        const blob = await new Promise<Blob|null>(r => cnv.toBlob(b => r(b), 'image/jpeg', 0.8));
-        if (blob){
-          const bmp = await createImageBitmap(blob);
-          const txt = await decodeFrame(bmp);
-          if (txt){
-            const now = performance.now();
-            if (txt !== lastTextRef.current || (now - lastTsRef.current) > 2000){
-              lastTextRef.current = txt;
-              lastTsRef.current = now;
-              onResult(txt.trim());
-              if (singleShot) { setRunning(false); return; }
-            }
-          }
+        const img = ctx.getImageData(0, 0, w, h);
+        // det.detect принимает ImageBitmap/Canvas, поэтому используем cnv
+        const res = await det.detect(cnv as any);
+        if (res && res[0]?.rawValue) deliver(res[0].rawValue);
+      } catch {}
+      loop();
+    };
+    loop();
+  }
+
+  /** ===== Canvas + ZXing (без worker) ===== */
+  async function tickCanvasZX() {
+    const v = videoRef.current!;
+    const reader = new BrowserMultiFormatReader();
+    zxingRef.current = reader;
+
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128, BarcodeFormat.EAN_13,
+      BarcodeFormat.EAN_8, BarcodeFormat.ITF, BarcodeFormat.CODABAR,
+      BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.CODE_39
+    ]);
+    reader.setHints(hints);
+
+    const loop = async () => {
+      if (!runningRef.current) return;
+      try {
+        const w = 320;
+        const h = Math.round(v.videoHeight * (w / v.videoWidth || 1));
+        const cnv = canvasRef.current!;
+        cnv.width = w; cnv.height = h;
+        const ctx = cnv.getContext('2d', { willReadFrequently:true })!;
+        ctx.drawImage(v, 0, 0, w, h);
+        const res = await reader.decodeFromCanvas(cnv);
+        if (res?.getText) {
+          deliver(res.getText());
+          if (singleShot) return stopZX();
         }
-      }catch(e){ onError?.(e); }
-      finally{
+      } catch {
+        // ничего — просто продолжаем
+      } finally {
         // @ts-ignore
-        if ('requestVideoFrameCallback' in v){ v.requestVideoFrameCallback(() => tick()); }
-        else { rAFRef.current = requestAnimationFrame(tick); }
+        if ('requestVideoFrameCallback' in v) {
+          // @ts-ignore
+          v.requestVideoFrameCallback(() => loop());
+        } else {
+          rAFRef.current = requestAnimationFrame(loop);
+        }
       }
     };
-    draw();
+    loop();
   }
 
   return (
