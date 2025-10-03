@@ -25,6 +25,35 @@ export default function InventoryScannerApp() {
   const [camOn, setCamOn] = useState(false);
   const [msg, setMsg] = useState('');
 
+  // === AUDIO (beep) =========================================================
+  const audioRef = useRef<AudioContext | null>(null);
+  function ensureAudio() {
+    // @ts-ignore
+    const AC = window.AudioContext || (window as any).webkitAudioContext;
+    if (!audioRef.current) audioRef.current = new AC();
+    if (audioRef.current.state === 'suspended') audioRef.current.resume();
+    return audioRef.current;
+  }
+  function beep(times = 1, freq = 880, dur = 0.08, gap = 0.06) {
+    try {
+      const ctx = ensureAudio();
+      let t = ctx.currentTime;
+      for (let i = 0; i < times; i++) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        osc.connect(gain).connect(ctx.destination);
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.exponentialRampToValueAtTime(0.2, t + 0.01);
+        osc.start(t);
+        osc.stop(t + dur);
+        t += dur + gap;
+      }
+    } catch {}
+  }
+  // ==========================================================================
+
   useEffect(() => {
     const socket = connectRT(sid, userIdRef.current);
     socketRef.current = socket;
@@ -75,6 +104,11 @@ export default function InventoryScannerApp() {
 
   async function onScan(text: string) {
     const inv = text.trim().replace(/^0+(\d)/, '$1');
+
+    // определим дубликат ДО изменения состояния
+    const was = allItems.find(x => x.inv === inv);
+    const willBeDuplicate = !!was?.scannedAt;
+
     setAllItems(prev => {
       const m = new Map(prev.map(x => [x.inv, x]));
       const it = m.get(inv);
@@ -86,6 +120,11 @@ export default function InventoryScannerApp() {
       m.set(inv, next);
       return [...m.values()];
     });
+
+    // звук: 1 бип успех, 3 бипа дубликат
+    if (willBeDuplicate) beep(3, 660, 0.06, 0.07);
+    else beep(1, 880, 0.08, 0.06);
+
     socketRef.current?.emit('scan', { sid, userId: userIdRef.current, inv });
   }
 
@@ -137,9 +176,16 @@ export default function InventoryScannerApp() {
     XLSX.writeFile(wb, fname);
   }
 
+  // включение камеры — хорошая «жестовая» точка, чтобы активировать аудио
+  function toggleCam() {
+    try { ensureAudio(); } catch {}
+    setCamOn(v => !v);
+  }
+
   return (
     <div className="min-h-screen pb-24 max-w-[520px] mx-auto">
-      <div className="sticky top-0 z-10 bg-white/90 backdrop-blur border-b border-green-100 px-3 pt-[env(safe-area-inset-top)]">
+      {/* STICKY header + STICKY counters */}
+      <div className="sticky top-0 z-20 bg-white/90 backdrop-blur border-b border-green-100 px-3 pt-[env(safe-area-inset-top)]">
         <div className="py-2 flex items-center gap-2">
           <div className="text-base font-semibold">Инвентаризация</div>
           <div className="ml-auto flex items-center gap-2">
@@ -147,16 +193,16 @@ export default function InventoryScannerApp() {
             <div className="text-xs text-gray-500">Сессия: <b>{sid}</b></div>
           </div>
         </div>
+        {/* Счётчики — тоже закреплены */}
+        <div className="grid grid-cols-4 gap-2 pb-2">
+          <Card t="Всего" v={stats.total} />
+          <Card t="Найдено" v={stats.found} ok />
+          <Card t="Дубликаты" v={stats.duplicates} warn />
+          <Card t="Осталось" v={stats.left} />
+        </div>
       </div>
 
       {msg && <div className="m-3 p-2 rounded-xl bg-green-50 border border-green-200 text-sm">{msg}</div>}
-
-      <div className="grid grid-cols-4 gap-2 p-3">
-        <Card t="Всего" v={stats.total} />
-        <Card t="Найдено" v={stats.found} ok />
-        <Card t="Дубликаты" v={stats.duplicates} warn />
-        <Card t="Осталось" v={stats.left} />
-      </div>
 
       <div className="card m-3">
         <div className="font-medium mb-2">Импорт</div>
@@ -171,7 +217,7 @@ export default function InventoryScannerApp() {
           <div className="font-medium">Сканирование</div>
           <span className="badge">{camOn ? 'камера вкл' : 'камера выкл'}</span>
         </div>
-        <button className="btn" onClick={()=>setCamOn(v=>!v)}>{camOn ? 'Стоп' : 'Включить'}</button>
+        <button className="btn" onClick={toggleCam}>{camOn ? 'Стоп' : 'Включить'}</button>
         {camOn && <Scanner onResult={onScan} />}
       </div>
 
