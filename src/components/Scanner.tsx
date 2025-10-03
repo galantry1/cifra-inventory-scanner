@@ -7,9 +7,25 @@ const UA = typeof navigator !== 'undefined' ? navigator.userAgent : '';
 const IS_IOS = /iPhone|iPad|iPod/i.test(UA);
 const HAS_CREATE_IMAGE_BITMAP = typeof window !== 'undefined' && 'createImageBitmap' in window;
 
-const BARCODE_FORMATS = [
-  'qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','codabar'
-] as const;
+// список форматов
+const HINTS = (() => {
+  const hints = new Map();
+  hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+    BarcodeFormat.QR_CODE,
+    BarcodeFormat.CODE_128,
+    BarcodeFormat.EAN_13,
+    BarcodeFormat.EAN_8,
+    BarcodeFormat.ITF,
+    BarcodeFormat.CODABAR,
+    BarcodeFormat.UPC_A,
+    BarcodeFormat.UPC_E,
+    BarcodeFormat.CODE_39
+  ]);
+  return hints;
+})();
+
+// спустя сколько «отсутствия» кода разрешать следующий такой же
+const CLEAR_AFTER_MS = 900;
 
 export default function Scanner({
   onResult, singleShot = false, onError
@@ -20,24 +36,22 @@ export default function Scanner({
   const [stream, setStream] = React.useState<MediaStream|null>(null);
   const [torch, setTorch] = React.useState(false);
   const runningRef = React.useRef(true);
-  const lastTextRef = React.useRef('');   // анти-дубли
-  const lastTsRef = React.useRef(0);
   const rAFRef = React.useRef<number>();
+
+  // анти-дубли «захват»
+  const holdCodeRef = React.useRef<string | null>(null);
+  const lastSeenRef = React.useRef<number>(0);
+
   const zxingRef = React.useRef<BrowserMultiFormatReader|null>(null);
 
   React.useEffect(() => { init(); return cleanup; }, []);
 
   async function init() {
     try {
-      const constraints: MediaStreamConstraints = {
-        video: {
-          facingMode: { ideal: 'environment' },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
+      const st = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false
-      };
-      const st = await navigator.mediaDevices.getUserMedia(constraints);
+      });
       setStream(st);
       const v = videoRef.current!;
       v.srcObject = st;
@@ -45,39 +59,24 @@ export default function Scanner({
 
       runningRef.current = true;
 
-      // Путь 1: нативный BarcodeDetector — быстрый
       if (HAS_BD) {
         tickBD();
         return;
       }
-
-      // Путь 2: надёжный мобильный фоллбек — ZXing по <video>
-      // (для iOS/старых браузеров, где нет createImageBitmap)
       if (IS_IOS || !HAS_CREATE_IMAGE_BITMAP) {
         const reader = new BrowserMultiFormatReader();
+        reader.setHints(HINTS);
         zxingRef.current = reader;
-
-        // подсказки форматов
-        const hints = new Map();
-        hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-          BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128, BarcodeFormat.EAN_13,
-          BarcodeFormat.EAN_8, BarcodeFormat.ITF, BarcodeFormat.CODABAR,
-          BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.CODE_39
-        ]);
-        reader.setHints(hints);
-
         await reader.decodeFromVideoElement(v, (res, err) => {
           if (!runningRef.current) return;
-          if (res?.getText) {
-            deliver(res.getText());
-            if (singleShot) stopZX(); // инициализируем остановку
-          }
+          if (res?.getText) maybeEmit(res.getText());
         });
+        // параллельно следим за «пропажей» кода для сброса захвата
+        idleWatcher();
         return;
       }
-
-      // Путь 3: worker/канвас (для Android/десктопа)
       tickCanvasZX();
+      idleWatcher();
     } catch (e) {
       onError?.(e);
     }
@@ -88,11 +87,6 @@ export default function Scanner({
     if (rAFRef.current) cancelAnimationFrame(rAFRef.current);
     if (zxingRef.current) { try { zxingRef.current.reset(); } catch {} zxingRef.current = null; }
     stream?.getTracks().forEach(t => t.stop());
-  }
-
-  function stopZX() {
-    runningRef.current = false;
-    if (zxingRef.current) { try { zxingRef.current.reset(); } catch {} zxingRef.current = null; }
   }
 
   function toggleTorch() {
@@ -107,22 +101,47 @@ export default function Scanner({
     }
   }
 
-  function deliver(txt: string) {
+  // единая точка выдачи результата с анти-дублем
+  function maybeEmit(txt: string) {
     const now = performance.now();
     const text = String(txt || '').trim();
     if (!text) return;
-    if (text !== lastTextRef.current || (now - lastTsRef.current) > 2000) {
-      lastTextRef.current = text;
-      lastTsRef.current = now;
+
+    if (holdCodeRef.current === null) {
+      // кода не захвачено — захватываем и отдаём
+      holdCodeRef.current = text;
+      lastSeenRef.current = now;
+      onResult(text);
+      if (singleShot) runningRef.current = false;
+    } else if (holdCodeRef.current === text) {
+      // тот же код — просто обновляем «видели»
+      lastSeenRef.current = now;
+    } else {
+      // другой код — сразу переключаем захват
+      holdCodeRef.current = text;
+      lastSeenRef.current = now;
       onResult(text);
     }
+  }
+
+  // если код пропал из кадра дольше CLEAR_AFTER_MS — сбрасываем захват
+  function idleWatcher() {
+    const loop = () => {
+      if (!runningRef.current) return;
+      const now = performance.now();
+      if (holdCodeRef.current && now - lastSeenRef.current > CLEAR_AFTER_MS) {
+        holdCodeRef.current = null;
+      }
+      rAFRef.current = requestAnimationFrame(loop);
+    };
+    loop();
   }
 
   /** ===== BarcodeDetector loop ===== */
   async function tickBD() {
     const v = videoRef.current!;
     // @ts-ignore
-    const det = new window.BarcodeDetector({ formats: BARCODE_FORMATS as any });
+    const det = new window.BarcodeDetector({ formats: ['qr_code','code_128','code_39','ean_13','ean_8','upc_a','upc_e','itf','codabar'] });
 
     const loop = async () => {
       if (!runningRef.current) return;
@@ -134,16 +153,15 @@ export default function Scanner({
         } else {
           await new Promise<void>(r => { rAFRef.current = requestAnimationFrame(() => r()); });
         }
+        const cnv = canvasRef.current!;
         const w = 320;
         const h = Math.round(v.videoHeight * (w / v.videoWidth || 1));
-        const cnv = canvasRef.current!;
         cnv.width = w; cnv.height = h;
         const ctx = cnv.getContext('2d', { willReadFrequently:true })!;
         ctx.drawImage(v, 0, 0, w, h);
-        const img = ctx.getImageData(0, 0, w, h);
-        // det.detect принимает ImageBitmap/Canvas, поэтому используем cnv
+
         const res = await det.detect(cnv as any);
-        if (res && res[0]?.rawValue) deliver(res[0].rawValue);
+        if (res && res[0]?.rawValue) maybeEmit(res[0].rawValue);
       } catch {}
       loop();
     };
@@ -154,32 +172,23 @@ export default function Scanner({
   async function tickCanvasZX() {
     const v = videoRef.current!;
     const reader = new BrowserMultiFormatReader();
+    reader.setHints(HINTS);
     zxingRef.current = reader;
-
-    const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.QR_CODE, BarcodeFormat.CODE_128, BarcodeFormat.EAN_13,
-      BarcodeFormat.EAN_8, BarcodeFormat.ITF, BarcodeFormat.CODABAR,
-      BarcodeFormat.UPC_A, BarcodeFormat.UPC_E, BarcodeFormat.CODE_39
-    ]);
-    reader.setHints(hints);
 
     const loop = async () => {
       if (!runningRef.current) return;
       try {
+        const cnv = canvasRef.current!;
         const w = 320;
         const h = Math.round(v.videoHeight * (w / v.videoWidth || 1));
-        const cnv = canvasRef.current!;
         cnv.width = w; cnv.height = h;
         const ctx = cnv.getContext('2d', { willReadFrequently:true })!;
         ctx.drawImage(v, 0, 0, w, h);
+
         const res = await reader.decodeFromCanvas(cnv);
-        if (res?.getText) {
-          deliver(res.getText());
-          if (singleShot) return stopZX();
-        }
+        if (res?.getText) maybeEmit(res.getText());
       } catch {
-        // ничего — просто продолжаем
+        // не нашли — это нормально, ждём следующий кадр
       } finally {
         // @ts-ignore
         if ('requestVideoFrameCallback' in v) {

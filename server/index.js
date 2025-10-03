@@ -29,12 +29,18 @@ app.post('/api/session/:sid/import', (req, res) => {
   for (const it of items) {
     const inv = String(it.inv || '').trim();
     const name = String(it.name || '').trim();
+    const location = (it.location ?? '').toString().trim() || null;
     if (!inv || !name) continue;
+
     const prev = S.items.get(inv) || {};
+    const actualLocation = prev.actualLocation || null;
+
     S.items.set(inv, {
       id: it.id || inv,
       inv, name,
-      serial: it.serial, location: it.location, resp: it.resp, note: it.note,
+      location,                // из 3-го столбца
+      actualLocation,          // фактический, если уже ставили
+      serial: it.serial, resp: it.resp, note: it.note,
       scannedAt: prev.scannedAt || null,
       duplicateCount: prev.duplicateCount || 0,
       lastUser: prev.lastUser || null,
@@ -60,9 +66,9 @@ app.delete('/api/session/:sid/clear', (req, res) => {
   res.json({ ok: true });
 });
 
-// сокеты: join + scan
+// сокеты: join + scan + relocate
 io.on('connection', (socket) => {
-  socket.on('join', ({ sid, userId }) => {
+  socket.on('join', ({ sid }) => {
     socket.join(sid);
     const S = sessions[sid] || (sessions[sid] = { items: new Map() });
     socket.emit('state', { items: [...S.items.values()] });
@@ -72,12 +78,24 @@ io.on('connection', (socket) => {
     const S = sessions[sid];
     if (!S) return;
     const it = S.items.get(inv);
-    if (!it) return; // код не найден в базе
+    if (!it) return;
 
     if (it.scannedAt) it.duplicateCount = (it.duplicateCount || 0) + 1;
     else it.scannedAt = new Date().toISOString();
     it.lastUser = userId;
 
+    S.items.set(inv, it);
+    io.to(sid).emit('itemUpdated', it);
+  });
+
+  // новый эвент: установка фактического кабинета
+  socket.on('relocate', ({ sid, inv, actualLocation }) => {
+    const S = sessions[sid];
+    if (!S) return;
+    const it = S.items.get(inv);
+    if (!it) return;
+
+    it.actualLocation = (actualLocation ?? '').toString().trim() || null;
     S.items.set(inv, it);
     io.to(sid).emit('itemUpdated', it);
   });
